@@ -22,6 +22,7 @@ For two-tower vision encoders (e.g., DeepSeek-OCR's SAM + CLIP with dynamic tili
 | Architecture | Models | CG for Image | CG for Video | Multi-Path Graph |
 | ------------ | ------ | ------------ | ------------ | --------------- |
 | `DeepseekOCRForCausalLM` | `DeepSeek-OCR` | ✅︎ | ❌︎ | ✅︎ |
+| `DeepseekOCR2ForCausalLM` | `DeepSeek-OCR-2` | ✅︎ | ❌︎ | ✅︎ |
 | `Ernie4_5_VLMoeForConditionalGeneration` | `ERNIE-4.5-VL` | ✅︎ | ❌︎ | ❌︎ |
 | `Gemma3ForConditionalGeneration` | `Gemma3` | ✅︎ | ❌︎ | ❌︎ |
 | `Glm4vForConditionalGeneration` | `GLM-4.1V, GLM-4.6V-Flash` | ✅︎ | ✅︎ | ❌︎ |
@@ -43,6 +44,7 @@ For two-tower vision encoders (e.g., DeepSeek-OCR's SAM + CLIP with dynamic tili
 | Architecture | NV Blackwell | NV Ampere | AMD MI300X | AMD MI350X / MI355X |
 | ------------ | ---------------- | ------------- | -------------- | --------------------- |
 | `DeepseekOCRForCausalLM` | ✅︎ | ✅︎ | ❔ | ✅︎ |
+| `DeepseekOCR2ForCausalLM` | ✅︎ | ❔ | ❔ | ❔ |
 | `Ernie4_5_VLMoeForConditionalGeneration` | ✅︎ | ✅︎ | ❔ | ✅︎ |
 | `Gemma3ForConditionalGeneration` | ✅︎ | ✅︎ | ❔ | ✅︎ |
 | `Glm4vForConditionalGeneration` | ✅︎ | ✅︎ | ❔ | ✅︎ |
