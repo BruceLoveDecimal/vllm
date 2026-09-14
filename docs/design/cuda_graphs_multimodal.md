@@ -22,6 +22,7 @@ For two-tower vision encoders (e.g., DeepSeek-OCR's SAM + CLIP with dynamic tili
 | Architecture | Models | CG for Image | CG for Video | Multi-Path Graph |
 | ------------ | ------ | ------------ | ------------ | --------------- |
 | `DeepseekOCRForCausalLM` | `DeepSeek-OCR` | ✅︎ | ❌︎ | ✅︎ |
+| `DeepseekOCR2ForCausalLM` | `DeepSeek-OCR-2` | ✅︎ | ❌︎ | ✅︎ |
 | `Ernie4_5_VLMoeForConditionalGeneration` | `ERNIE-4.5-VL` | ✅︎ | ❌︎ | ❌︎ |
 | `Gemma3ForConditionalGeneration` | `Gemma3` | ✅︎ | ❌︎ | ❌︎ |
 | `Glm4vForConditionalGeneration` | `GLM-4.1V, GLM-4.6V-Flash` | ✅︎ | ✅︎ | ❌︎ |
@@ -43,6 +44,7 @@ For two-tower vision encoders (e.g., DeepSeek-OCR's SAM + CLIP with dynamic tili
 | Architecture | NV Blackwell | NV Ampere | AMD MI300X | AMD MI350X / MI355X |
 | ------------ | ---------------- | ------------- | -------------- | --------------------- |
 | `DeepseekOCRForCausalLM` | ✅︎ | ✅︎ | ❔ | ✅︎ |
+| `DeepseekOCR2ForCausalLM` | ❔ | ❔ | ❔ | ❔ |
 | `Ernie4_5_VLMoeForConditionalGeneration` | ✅︎ | ✅︎ | ❔ | ✅︎ |
 | `Gemma3ForConditionalGeneration` | ✅︎ | ✅︎ | ❔ | ✅︎ |
 | `Glm4vForConditionalGeneration` | ✅︎ | ✅︎ | ❔ | ✅︎ |
@@ -114,7 +116,7 @@ For each graph replay:
 
 ### Multi-Path graph capture
 
-`EncoderCudaGraphConfig.paths` maps path names to `EncoderCudaGraphPathConfig` capture policies. For example, DeepSeek-OCR configures a **global** image path and a **local** patch path, which are captured independently under `budget_graphs["global"]` and `budget_graphs["local"]`.
+`EncoderCudaGraphConfig.paths` maps path names to `EncoderCudaGraphPathConfig` capture policies. For example, DeepSeek-OCR configures a **global** image path and a **local** patch path, which are captured independently under `budget_graphs["global"]` and `budget_graphs["local"]`. DeepSeek-OCR-2 follows the same layout with a `1024×1024` global view (256 tokens) and `768×768` local patches (144 tokens each); its outputs carry no newline tokens, so post-processing only concatenates `[patches, global, view_separator]`.
 
 **Budget generation.** Each path gets a separate budget list. For DeepSeek-OCR:
 

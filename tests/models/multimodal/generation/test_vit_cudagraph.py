@@ -311,6 +311,24 @@ MODEL_CONFIGS: dict[str, VitCudagraphTestConfig] = {
         },
         skip=True,  # TODO: Re-enable this once OOM issues are resolved on CI.
     ),
+    "deepseek_ocr2": VitCudagraphTestConfig(
+        model="deepseek-ai/DeepSeek-OCR-2",
+        modalities=["image"],
+        image_prompt="<image>\nWhat is in this image?",
+        marks=[pytest.mark.core_model],
+        compilation_config_overrides={
+            "encoder_cudagraph_token_budgets": [256],
+            "mode": 0,
+            "cudagraph_mode": 2,
+        },
+        vllm_runner_kwargs={
+            "load_format": "dummy",
+            "hf_overrides": partial(
+                dummy_hf_overrides,
+                model_arch="DeepseekOCR2ForCausalLM",
+            ),
+        },
+    ),
     "gemma4": VitCudagraphTestConfig(
         model="google/gemma-4-E2B-it",
         image_prompt=(

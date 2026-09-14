@@ -968,3 +968,269 @@ class TestInitInvariantValidation:
 
         with pytest.raises(ValueError, match="must be positive"):
             CompilationConfig(encoder_cudagraph_token_budgets=[-1, 64])
+
+
+# ---------------------------------------------------------------------------
+# DeepSeek-OCR-2 dual-path protocol methods (CPU, no weights)
+# ---------------------------------------------------------------------------
+
+_OCR2_GLOBAL_TOKENS = 256  # ceil((1024 // 16) / 4) ** 2
+_OCR2_PATCH_TOKENS = 144  # ceil((768 // 16) / 4) ** 2
+_OCR2_GLOBAL_INPUT = 64 * 64
+_OCR2_PATCH_INPUT = 48 * 48
+_OCR2_EMBED = 8
+
+
+def _make_ocr2_model():
+    """Build a DeepseekOCR2ForCausalLM skeleton without loading weights.
+
+    Only the attributes read by the SupportsEncoderCudaGraph methods are set,
+    so the shape/ordering logic can run on CPU.
+    """
+    from types import SimpleNamespace
+
+    from vllm.model_executor.models.deepseek_ocr2 import DeepseekOCR2ForCausalLM
+
+    model = DeepseekOCR2ForCausalLM.__new__(DeepseekOCR2ForCausalLM)
+    torch.nn.Module.__init__(model)
+    model.projector_config = SimpleNamespace(n_embed=_OCR2_EMBED)
+    model.view_seperator = torch.nn.Parameter(torch.full((_OCR2_EMBED,), -1.0))
+    return model
+
+
+def _make_ocr2_mm_kwargs(spatial_crops: list[list[int]]) -> dict[str, Any]:
+    """Build OCR-2 style mm_kwargs; each image's crops are filled with its
+    image index so slicing/ordering can be checked after selection."""
+    images_spatial_crop = torch.tensor(spatial_crops, dtype=torch.long)
+    pixel_values = torch.stack(
+        [torch.full((3, 4, 4), float(i)) for i in range(len(spatial_crops))]
+    )
+    crops = []
+    for i, (w, h) in enumerate(spatial_crops):
+        if w > 1 or h > 1:
+            crops.append(torch.full((w * h, 3, 2, 2), float(i)))
+    images_crop = torch.cat(crops) if crops else torch.zeros((0, 3, 2, 2))
+    return {
+        "pixel_values": pixel_values,
+        "images_crop": images_crop,
+        "images_spatial_crop": images_spatial_crop,
+    }
+
+
+class TestDeepseekOCR2EncoderCudaGraph:
+    def setup_method(self):
+        self.model = _make_ocr2_model()
+
+    def test_config_defines_global_and_local_paths(self):
+        config = self.model.get_encoder_cudagraph_config()
+        assert config.modalities == ["image"]
+        assert config.out_hidden_size == _OCR2_EMBED
+        assert config.paths["global"].min_token_budget == _OCR2_GLOBAL_TOKENS
+        assert not config.paths["global"].allow_zero_tokens
+        assert config.paths["local"].min_token_budget == _OCR2_PATCH_TOKENS
+        assert config.paths["local"].allow_zero_tokens
+
+    def test_manager_builds_per_path_budgets(self):
+        """Global budgets start at 256, local budgets start at 0 then 144."""
+        mgr = EncoderCudaGraphManager(
+            vllm_config=_MockVllmConfig(token_budgets=[256, 512], max_mm_items=2),
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+            model=self.model,
+        )
+        assert mgr.path_token_budgets["global"] == [256, 512]
+        assert mgr.path_token_budgets["local"] == [0, 144, 288, 512]
+
+    def test_item_specs_untiled_and_tiled(self):
+        specs = self.model.get_encoder_cudagraph_item_specs(
+            _make_ocr2_mm_kwargs([[1, 1], [2, 3]])
+        )
+        untiled, tiled = specs
+
+        assert untiled.input_size == _OCR2_GLOBAL_INPUT
+        assert untiled.path_output_tokens == {"global": _OCR2_GLOBAL_TOKENS, "local": 0}
+        assert untiled.output_tokens == _OCR2_GLOBAL_TOKENS + 1
+
+        assert tiled.input_size == _OCR2_GLOBAL_INPUT + 6 * _OCR2_PATCH_INPUT
+        assert tiled.path_output_tokens == {
+            "global": _OCR2_GLOBAL_TOKENS,
+            "local": 6 * _OCR2_PATCH_TOKENS,
+        }
+        assert tiled.output_tokens == _OCR2_GLOBAL_TOKENS + 6 * _OCR2_PATCH_TOKENS + 1
+
+    def test_item_specs_match_processor_token_count(self):
+        """output_tokens must equal what the processor inserts into the prompt."""
+        from vllm.model_executor.models.deepseek_ocr2 import (
+            DeepseekOCR2ProcessingInfo,
+        )
+
+        info = DeepseekOCR2ProcessingInfo.__new__(DeepseekOCR2ProcessingInfo)
+        # 1000x1000 tiles into more than one crop; 500x500 stays untiled.
+        for size, crop in ((500, [1, 1]), (1000, None)):
+            if crop is None:
+                from vllm.transformers_utils.processors.deepseek_ocr import (
+                    count_tiles,
+                )
+
+                crop = list(count_tiles(size, size, image_size=768))
+            (spec,) = self.model.get_encoder_cudagraph_item_specs(
+                _make_ocr2_mm_kwargs([crop])
+            )
+            assert spec.output_tokens == info.get_num_image_tokens(
+                image_width=size, image_height=size
+            )
+
+    def test_select_items_slices_crops_by_cumulative_offsets(self):
+        mm_kwargs = _make_ocr2_mm_kwargs([[1, 1], [2, 2], [1, 3]])
+        selected = self.model.select_encoder_cudagraph_items(mm_kwargs, [2, 0])
+
+        assert selected["pixel_values"][:, 0, 0, 0].tolist() == [2.0, 0.0]
+        assert selected["images_spatial_crop"].tolist() == [[1, 3], [1, 1]]
+        # Image 2 has 3 crops, image 0 has none.
+        assert selected["images_crop"].shape[0] == 3
+        assert selected["images_crop"][:, 0, 0, 0].tolist() == [2.0, 2.0, 2.0]
+
+    def test_select_items_empty(self):
+        mm_kwargs = _make_ocr2_mm_kwargs([[2, 2]])
+        selected = self.model.select_encoder_cudagraph_items(mm_kwargs, [])
+        assert selected["pixel_values"].shape[0] == 0
+        assert selected["images_crop"].shape[0] == 0
+        assert selected["images_spatial_crop"].shape[0] == 0
+
+    def test_capture_inputs_shapes_per_path(self):
+        device, dtype = torch.device("cpu"), torch.float32
+        global_inputs = self.model.prepare_encoder_cudagraph_capture_inputs(
+            512, 8, 0, device, dtype, path="global"
+        )
+        # Budget 512 fits two 256-token global views even with max_batch 8.
+        assert global_inputs.values["pixel_values"].shape == (2, 3, 1024, 1024)
+
+        local_inputs = self.model.prepare_encoder_cudagraph_capture_inputs(
+            288, 8, 0, device, dtype, path="local"
+        )
+        assert local_inputs.values["images_crop"].shape == (2, 3, 768, 768)
+
+    def test_replay_buffers_select_path_key(self):
+        mm_kwargs = _make_ocr2_mm_kwargs([[2, 2]])
+        g = self.model.prepare_encoder_cudagraph_replay_buffers(
+            mm_kwargs, 1, 0, path="global"
+        )
+        assert set(g.values) == {"pixel_values"}
+        loc = self.model.prepare_encoder_cudagraph_replay_buffers(
+            mm_kwargs, 1, 0, path="local"
+        )
+        assert set(loc.values) == {"images_crop"}
+
+    def test_postprocess_assembles_local_global_separator(self):
+        """Per image: [local patches..., global, view_seperator], in order,
+        for a batch mixing an untiled and a tiled image with padded outputs."""
+        mm_kwargs = _make_ocr2_mm_kwargs([[1, 1], [2, 1]])
+        bsz, total_patches = 2, 2
+
+        # Encode (row index) into the feature so ordering is observable.
+        global_rows = bsz * _OCR2_GLOBAL_TOKENS
+        global_out = torch.arange(global_rows + 64, dtype=torch.float32)
+        global_out = global_out[:, None].expand(-1, _OCR2_EMBED).clone()
+        local_rows = total_patches * _OCR2_PATCH_TOKENS
+        local_out = 1000 + torch.arange(local_rows + 144, dtype=torch.float32)
+        local_out = local_out[:, None].expand(-1, _OCR2_EMBED).clone()
+
+        dest: dict[int, torch.Tensor] = {}
+        self.model.postprocess_encoder_output(
+            {"global": global_out, "local": local_out},
+            indices=[5, 7],
+            per_item_out_tokens=[],
+            dest=dest,
+            batch_mm_kwargs=mm_kwargs,
+        )
+
+        untiled = dest[5]
+        assert untiled.shape == (_OCR2_GLOBAL_TOKENS + 1, _OCR2_EMBED)
+        assert untiled[:-1, 0].tolist() == list(range(_OCR2_GLOBAL_TOKENS))
+        assert untiled[-1, 0].item() == -1.0
+
+        tiled = dest[7]
+        n_local = 2 * _OCR2_PATCH_TOKENS
+        assert tiled.shape == (n_local + _OCR2_GLOBAL_TOKENS + 1, _OCR2_EMBED)
+        assert tiled[:n_local, 0].tolist() == [1000 + r for r in range(n_local)]
+        assert tiled[n_local:-1, 0].tolist() == [
+            _OCR2_GLOBAL_TOKENS + r for r in range(_OCR2_GLOBAL_TOKENS)
+        ]
+        assert tiled[-1, 0].item() == -1.0
+
+    def test_postprocess_without_local_output(self):
+        """A batch with only untiled images gets no 'local' entry."""
+        mm_kwargs = _make_ocr2_mm_kwargs([[1, 1]])
+        global_out = torch.zeros((_OCR2_GLOBAL_TOKENS, _OCR2_EMBED))
+        dest: list[torch.Tensor | None] = [None]
+        self.model.postprocess_encoder_output(
+            {"global": global_out}, [0], [], dest, batch_mm_kwargs=mm_kwargs
+        )
+        assert dest[0] is not None
+        assert dest[0].shape == (_OCR2_GLOBAL_TOKENS + 1, _OCR2_EMBED)
+
+    def test_execute_local_matches_eager_forward(self):
+        """Greedy packing + per-path replay/fallback must reproduce the eager
+        per-image embeddings, including a batch whose local path exceeds every
+        budget and falls back to eager for that path only."""
+        torch.manual_seed(0)
+        model = self.model
+        n_embed = _OCR2_EMBED
+
+        class _FakeSam(torch.nn.Module):
+            def forward(self, x):  # [B, 3, S, S] -> [B, 3, S/64, S/64]
+                return torch.nn.functional.avg_pool2d(x, 64)
+
+        class _FakeQwen2(torch.nn.Module):
+            def forward(self, x):  # -> [B, hw, 3]
+                return x.flatten(2).transpose(1, 2)
+
+        model.sam_model = _FakeSam()
+        model.qwen2_model = _FakeQwen2()
+        model.projector = torch.nn.Linear(3, n_embed)
+
+        spatial_crops = [[1, 1], [2, 1], [2, 2]]
+        images_spatial_crop = torch.tensor(spatial_crops, dtype=torch.long)
+        pixel_values = torch.randn(len(spatial_crops), 3, 1024, 1024)
+        images_crop = torch.randn(6, 3, 768, 768)
+        mm_kwargs = {
+            "pixel_values": pixel_values,
+            "images_crop": images_crop,
+            "images_spatial_crop": images_spatial_crop,
+        }
+
+        mgr = EncoderCudaGraphManager(
+            vllm_config=_MockVllmConfig(token_budgets=[256, 512], max_mm_items=2),
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+            model=model,
+        )
+        replayed: list[tuple[str, int]] = []
+
+        def fake_replay(batch_kwargs, token_budget, path="default", axis_keys=()):
+            capture = model.prepare_encoder_cudagraph_capture_inputs(
+                token_budget, mgr.max_batch_size, 0, mgr.device, mgr.dtype, path
+            )
+            replay = model.prepare_encoder_cudagraph_replay_buffers(
+                batch_kwargs, mgr.max_batch_size, 0, path
+            )
+            for key, buf in capture.values.items():
+                src = replay.values[key]
+                assert src.shape[0] <= buf.shape[0]
+                EncoderCudaGraphManager._copy_padded_buffer(buf, src)
+            replayed.append((path, token_budget))
+            return model.encoder_cudagraph_forward(capture.values, path)
+
+        mgr._run_budget_graph = fake_replay  # type: ignore[method-assign]
+
+        with torch.no_grad():
+            outputs = mgr._execute_local(mm_kwargs)
+            expected = model.encoder_eager_forward(mm_kwargs)
+
+        # Images 0+1 pack into one batch (global 512, local 288); image 2's
+        # 4 patches (576 tokens) exceed the largest local budget -> eager.
+        assert sorted(replayed) == [("global", 256), ("global", 512), ("local", 288)]
+
+        sizes = [_OCR2_GLOBAL_TOKENS + n * _OCR2_PATCH_TOKENS + 1 for n in (0, 2, 4)]
+        assert [o.shape[0] for o in outputs] == sizes
+        torch.testing.assert_close(torch.cat(outputs), expected)
